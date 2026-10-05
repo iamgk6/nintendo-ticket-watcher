@@ -20,7 +20,7 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +41,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-        run: node watcher.mjs --test
+        run: node watcher.mjs 
 
       - name: 執行監控
         if: ${{ !inputs.test }}
@@ -54,7 +54,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
-        run: node watcher.mjs
+        run: node watcher.mjs --loop-min 55
 
       - name: 保存狀態
         if: ${{ !inputs.test }}
