@@ -1,6 +1,7 @@
 // 任天堂博物館購票監控:輪詢公開日曆 API,狀態變化時發 Telegram / Email 通知。
 // 用法:
 //   node watcher.mjs           執行一次檢查(正式模式,供 GitHub Actions 呼叫)
+//   node watcher.mjs --loop-min 55   連續監看 55 分鐘:每 60 秒檢查一次(GitHub Actions 用)
 //   node watcher.mjs --dry     只顯示目前狀態與差異,不通知、不寫入狀態檔
 //   node watcher.mjs --test    只發送測試通知,不做檢查
 //   node watcher.mjs --selftest  驗證比對邏輯(不需要網路)
@@ -17,6 +18,16 @@ const flags = new Set(process.argv.slice(2));
 const DRY = flags.has('--dry');
 const TEST_NOTIFY = flags.has('--test');
 const SELFTEST = flags.has('--selftest');
+
+function numFlag(argv, name, dflt) {
+  const i = argv.indexOf(name);
+  if (i === -1) return dflt;
+  const v = Number(argv[i + 1]);
+  return Number.isFinite(v) && v > 0 ? v : dflt;
+}
+// --loop-min N:連續監看 N 分鐘,每 --interval-sec 秒(預設 60,下限 20)檢查一次;0=只檢查一次
+const LOOP_MIN = numFlag(process.argv, '--loop-min', 0);
+const INTERVAL_SEC = Math.max(20, numFlag(process.argv, '--interval-sec', 60));
 
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
 const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, 'state.json');
@@ -405,12 +416,78 @@ function runSelftest() {
   const ev5 = diffEvents({ '2026-12': null }, { '2026-12': { '2026-12-01': [3, 1, 1, 0], '2026-12-02': [3, 2, 1, 0] } }, cfg, today);
   const msg5 = buildChangeMessage(ev5, cfg);
   t('月份公布時顯示目前有票天數', ev5.length === 1 && ev5[0].availDays?.length === 1 && msg5.includes('目前有票 1 天'));
+
+  t('解析 --loop-min / --interval-sec 參數', numFlag(['--loop-min', '55'], '--loop-min', 0) === 55 && numFlag([], '--loop-min', 0) === 0 && numFlag(['--interval-sec', 'abc'], '--interval-sec', 60) === 60);
+}
+
+async function collectMonths(prevState) {
+  const nextMonths = {};
+  for (const m of config.watchMonths) {
+    const [y, mm] = m.split('-').map(Number);
+    const calendar = await fetchCalendar(y, mm);
+    let compact = compactCalendar(calendar);
+    if (compact === null && prevState?.months?.[m]) {
+      log(`注意:${m} 暫時回傳無資料,保留先前狀態,避免誤判`);
+      compact = prevState.months[m];
+    }
+    nextMonths[m] = compact;
+    log(`已檢查 ${m}:${compact ? `共 ${Object.keys(compact).length} 天資料` : '尚未公布售票資訊'}`);
+  }
+  return nextMonths;
+}
+
+// 執行一輪檢查;nextState 為 null 表示這輪不寫入狀態(通知未成功,下一輪會重試)
+async function checkOnce(prevState) {
+  const todayJst = jstToday();
+  const nextMonths = await collectMonths(prevState);
+  const nextState = { months: nextMonths };
+
+  if (!prevState?.months || !Object.keys(prevState.months).length) {
+    const text = buildStartupMessage(config, nextMonths, todayJst);
+    log('首次執行:建立狀態基準並發送啟動通知');
+    const results = await sendAll(text, '【任天堂博物館】票券監控已啟動');
+    if (!Object.values(results).some((v) => v === true)) {
+      log('啟動通知發送失敗,本次不寫入狀態,下次執行會重試(請檢查通知設定)');
+      return { nextState: null };
+    }
+    return { nextState };
+  }
+
+  const events = diffEvents(prevState.months, nextMonths, config, todayJst);
+  if (!events.length) {
+    log('沒有變化');
+    return { nextState };
+  }
+  for (const e of events.filter((e) => e.type === 'available')) {
+    try {
+      e.slots = await fetchTimeSlots(e.date);
+    } catch (err) {
+      log(`時段查詢失敗 ${e.date}:${err.message}`);
+      e.slots = null;
+    }
+  }
+  const text = buildChangeMessage(events, config);
+  if (!text) {
+    log(`偵測到 ${events.length} 項變化,但依設定不需通知`);
+    return { nextState };
+  }
+  log(`偵測到 ${events.length} 項變化:\n${text}`);
+  const results = await sendAll(text, buildSubject(events));
+  if (!Object.values(results).some((v) => v === true)) {
+    log('所有通知管道皆失敗,保留舊狀態,下次執行會重試');
+    return { nextState: null };
+  }
+  return { nextState };
+}
+
+function writeState(state) {
+  fs.writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 1)}\n`);
+  log(`狀態已更新:${STATE_FILE}`);
 }
 
 async function main() {
   if (SELFTEST) return runSelftest();
 
-  const todayJst = jstToday();
   const { telegram, mail } = getChannels();
   if (!DRY && !telegram && !mail) {
     log('錯誤:未設定任何通知管道。請設定 Telegram(TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)或 Email(SMTP_USER/SMTP_PASS/MAIL_TO)。');
@@ -435,62 +512,38 @@ async function main() {
     prevState = null;
   }
 
-  const nextMonths = {};
-  for (const m of config.watchMonths) {
-    const [y, mm] = m.split('-').map(Number);
-    const calendar = await fetchCalendar(y, mm);
-    let compact = compactCalendar(calendar);
-    if (compact === null && prevState?.months?.[m]) {
-      log(`注意:${m} 暫時回傳無資料,保留先前狀態,避免誤判`);
-      compact = prevState.months[m];
-    }
-    nextMonths[m] = compact;
-    log(`已檢查 ${m}:${compact ? `共 ${Object.keys(compact).length} 天資料` : '尚未公布售票資訊'}`);
-  }
-  const nextState = { months: nextMonths };
-
   if (DRY) {
-    await printDryReport(prevState, nextState, config, todayJst);
+    const nextMonths = await collectMonths(prevState);
+    await printDryReport(prevState, { months: nextMonths }, config, jstToday());
     return;
   }
 
-  if (!prevState?.months || !Object.keys(prevState.months).length) {
-    const text = buildStartupMessage(config, nextMonths, todayJst);
-    log('首次執行:建立狀態基準並發送啟動通知');
-    const results = await sendAll(text, '【任天堂博物館】票券監控已啟動');
-    if (!Object.values(results).some((v) => v === true)) {
-      log('啟動通知發送失敗,本次不寫入狀態,下次執行會重試(請檢查通知設定)');
-      process.exit(1);
-    }
-  } else {
-    const events = diffEvents(prevState.months, nextMonths, config, todayJst);
-    if (!events.length) {
-      log('沒有變化');
-    } else {
-      for (const e of events.filter((e) => e.type === 'available')) {
-        try {
-          e.slots = await fetchTimeSlots(e.date);
-        } catch (err) {
-          log(`時段查詢失敗 ${e.date}:${err.message}`);
-          e.slots = null;
-        }
-      }
-      const text = buildChangeMessage(events, config);
-      if (!text) {
-        log(`偵測到 ${events.length} 項變化,但依設定不需通知`);
-      } else {
-        log(`偵測到 ${events.length} 項變化:\n${text}`);
-        const results = await sendAll(text, buildSubject(events));
-        if (!Object.values(results).some((v) => v === true)) {
-          log('所有通知管道皆失敗,保留舊狀態,下次執行會重試');
-          process.exit(1);
-        }
-      }
-    }
+  if (LOOP_MIN <= 0) {
+    const result = await checkOnce(prevState);
+    if (!result.nextState) process.exit(1);
+    writeState(result.nextState);
+    return;
   }
 
-  fs.writeFileSync(STATE_FILE, `${JSON.stringify(nextState, null, 1)}\n`);
-  log(`狀態已更新:${STATE_FILE}`);
+  // 連續監看:GitHub 排程常延遲 10~25 分鐘,用長迴圈把實際檢查間隔壓到約 INTERVAL_SEC 秒
+  log(`連續監看模式:每 ${INTERVAL_SEC} 秒檢查一次,持續約 ${LOOP_MIN} 分鐘`);
+  const deadline = Date.now() + LOOP_MIN * 60000;
+  let rounds = 0;
+  while (true) {
+    rounds++;
+    try {
+      const result = await checkOnce(prevState);
+      if (result.nextState) {
+        if (JSON.stringify(result.nextState) !== JSON.stringify(prevState)) writeState(result.nextState);
+        prevState = result.nextState;
+      }
+    } catch (err) {
+      log(`第 ${rounds} 輪檢查失敗(將於下一輪重試):${err.message}`);
+    }
+    if (Date.now() + INTERVAL_SEC * 1000 > deadline) break;
+    await new Promise((r) => setTimeout(r, INTERVAL_SEC * 1000));
+  }
+  log(`連續監看結束,共執行 ${rounds} 輪`);
 }
 
 main().catch((err) => {
