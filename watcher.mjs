@@ -93,13 +93,50 @@ function compactCalendar(calendar) {
   return out;
 }
 
+// 免登入的時段 API:每個時段的庫存狀態(1=有位 2=剩少量 3=售完)
+async function fetchTimeSlots(date) {
+  const url = `${BASE_URL}/en/api/ticket/purchase/timeSchedule?target_date=${date}`;
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          'X-Requested-With': 'XMLHttpRequest',
+          'User-Agent': 'nintendo-museum-ticket-watcher/1.0 (personal use)',
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const ts = json?.data?.timeSchedules;
+      if (!ts || typeof ts !== 'object') throw new Error('回應格式不如預期');
+      return Object.values(ts).sort((a, b) => (a.startTime || '').localeCompare(b.startTime || ''));
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+  }
+  throw new Error(`無法取得 ${date} 時段資訊:${lastErr.message}`);
+}
+
+// 濃縮成「10:00○ 10:30△」;○=有位、△=剩少量,已滿或臨時休館的時段不列出
+function formatSlots(slots) {
+  const open = slots.filter((s) => !s.isTemporaryClosure && s.displayStockStatus !== 3);
+  if (!open.length) return '全部時段已額滿';
+  return open.map((s) => `${(s.startTime || '').slice(0, 5)}${s.displayStockStatus === 2 ? '△' : '○'}`).join(' ');
+}
+
 function diffEvents(prevMonths, nextMonths, cfg, todayJst) {
   const events = [];
   for (const [month, days] of Object.entries(nextMonths)) {
     const prevDays = prevMonths ? prevMonths[month] : undefined;
     if (prevDays === undefined) continue; // 新加入監控的月份只建立基準,不通知
     if (prevDays === null && days !== null) {
-      events.push({ type: 'month-open', month });
+      const availDays = Object.entries(days)
+        .filter(([d, e]) => d > todayJst && isAvailable(e))
+        .map(([d]) => d);
+      events.push({ type: 'month-open', month, availDays });
       continue;
     }
     if (!days || !prevDays) continue;
@@ -121,20 +158,34 @@ function buildChangeMessage(events, cfg) {
   const lines = [];
   if (avail.length) {
     lines.push('【有票了!】下列日期出現可購票狀態:');
-    for (const e of avail) lines.push(`- ${fmtDate(e.date)}${e.isTarget ? '  ← 你的目標日期!' : ''}`);
+    for (const e of avail) {
+      lines.push(`- ${fmtDate(e.date)}${e.isTarget ? '  ← 你的目標日期!' : ''}`);
+      if (e.slots === null) lines.push('  時段:查詢失敗,請直接上購票頁面確認');
+      else if (Array.isArray(e.slots)) lines.push(`  時段(○有位/△少量,未列出=已滿):${formatSlots(e.slots)}`);
+    }
   }
   if (soldout.length) {
     if (lines.length) lines.push('');
-    lines.push('【又售完】先前可買的日期已售完:');
+    lines.push('【又售完】下列日期又賣完了(不用前往購票):');
     for (const e of soldout) lines.push(`- ${fmtDate(e.date)}`);
   }
   if (opened.length) {
     if (lines.length) lines.push('');
     lines.push('【售票資訊公布】');
-    for (const e of opened) lines.push(`- ${e.month} 的日期狀態已可查看`);
+    for (const e of opened) {
+      const n = e.availDays?.length || 0;
+      lines.push(`- ${e.month} 的日期狀態已可查看${n ? `,目前有票 ${n} 天${e.availDays.some((d) => cfg.targetDates.includes(d)) ? '(含你的目標日期!)' : ''}` : ''}`);
+      if (n) lines.push(`  ${e.availDays.slice(0, 8).map(fmtDate).join('、')}${n > 8 ? ' …' : ''}`);
+    }
   }
   if (!lines.length) return '';
-  lines.push('', '購票頁面(登入後盡快結帳):', CALENDAR_PAGE, '釋出的票通常幾分鐘內會被搶完,請立即行動。');
+  if (avail.length || opened.some((e) => e.availDays?.length)) {
+    lines.push('', '購票頁面(登入後盡快結帳):', CALENDAR_PAGE, '釋出的票通常幾分鐘內會被搶完,請立即行動。');
+  } else if (opened.length) {
+    lines.push('', `購票頁面:${CALENDAR_PAGE}`, '目前尚無可購買的日期,出現變化會再通知。');
+  } else {
+    lines.push('', '此為狀態更新,不需前往購票。');
+  }
   return lines.join('\n');
 }
 
@@ -143,7 +194,7 @@ function buildSubject(events) {
   if (avail.length) return `【任天堂博物館】有票了!${avail.map((e) => fmtDate(e.date)).join('、')}`;
   const opened = events.filter((e) => e.type === 'month-open');
   if (opened.length) return `【任天堂博物館】${opened.map((e) => e.month).join('、')} 售票資訊公布`;
-  return '【任天堂博物館】售票狀態更新';
+  return '【任天堂博物館】又售完通知(不需立即行動)';
 }
 
 function buildStartupMessage(cfg, months, todayJst) {
@@ -242,7 +293,7 @@ async function sendAll(text, subject) {
   return results;
 }
 
-function printDryReport(prevState, nextState, cfg, todayJst) {
+async function printDryReport(prevState, nextState, cfg, todayJst) {
   console.log(`(dry-run:今日 JST ${todayJst};不發通知、不寫狀態)`);
   for (const [month, days] of Object.entries(nextState.months)) {
     console.log(`\n== ${month} ==`);
@@ -275,6 +326,13 @@ function printDryReport(prevState, nextState, cfg, todayJst) {
     else {
       for (const e of events) {
         console.log(`  ${e.type}${e.date ? ` ${fmtDate(e.date)}` : ` ${e.month}`}${e.isTarget ? ' (目標日期)' : ''}`);
+      }
+      for (const e of events.filter((e) => e.type === 'available')) {
+        try {
+          e.slots = await fetchTimeSlots(e.date);
+        } catch {
+          e.slots = null;
+        }
       }
       const text = buildChangeMessage(events, cfg);
       console.log('\n--- 正式執行時會發送的內容 ---');
@@ -326,6 +384,27 @@ function runSelftest() {
 
   const msgQuiet = buildChangeMessage([{ type: 'soldout', date: '2026-10-25' }], { ...cfg, notifyWhenSoldOutAgain: false });
   t('關閉「又售完」通知時不產生內容', msgQuiet === '');
+
+  const msgSoldout = buildChangeMessage([{ type: 'soldout', date: '2026-10-25' }], cfg);
+  t('售完通知不引導去搶票', msgSoldout.includes('不需前往購票') && !msgSoldout.includes('立即行動'));
+
+  const slots = [
+    { startTime: '10:00:00', displayStockStatus: 1 },
+    { startTime: '10:30:00', displayStockStatus: 2 },
+    { startTime: '11:00:00', displayStockStatus: 3 },
+    { startTime: '11:30:00', displayStockStatus: 1, isTemporaryClosure: true },
+  ];
+  t('時段格式:○ 與 △,排除售完/臨時休館', formatSlots(slots) === '10:00○ 10:30△');
+  t('時段全滿時顯示提示', formatSlots([{ startTime: '10:00:00', displayStockStatus: 3 }]) === '全部時段已額滿');
+
+  const msgSlots = buildChangeMessage([{ type: 'available', date: '2026-10-24', isTarget: true, slots }], cfg);
+  t('有票訊息包含時段資訊', msgSlots.includes('10:00○') && msgSlots.includes('目標日期'));
+  const msgSlotsFail = buildChangeMessage([{ type: 'available', date: '2026-10-24', isTarget: true, slots: null }], cfg);
+  t('時段查詢失敗時提示改看購票頁', msgSlotsFail.includes('查詢失敗'));
+
+  const ev5 = diffEvents({ '2026-12': null }, { '2026-12': { '2026-12-01': [3, 1, 1, 0], '2026-12-02': [3, 2, 1, 0] } }, cfg, today);
+  const msg5 = buildChangeMessage(ev5, cfg);
+  t('月份公布時顯示目前有票天數', ev5.length === 1 && ev5[0].availDays?.length === 1 && msg5.includes('目前有票 1 天'));
 }
 
 async function main() {
@@ -371,7 +450,7 @@ async function main() {
   const nextState = { months: nextMonths };
 
   if (DRY) {
-    printDryReport(prevState, nextState, config, todayJst);
+    await printDryReport(prevState, nextState, config, todayJst);
     return;
   }
 
@@ -388,6 +467,14 @@ async function main() {
     if (!events.length) {
       log('沒有變化');
     } else {
+      for (const e of events.filter((e) => e.type === 'available')) {
+        try {
+          e.slots = await fetchTimeSlots(e.date);
+        } catch (err) {
+          log(`時段查詢失敗 ${e.date}:${err.message}`);
+          e.slots = null;
+        }
+      }
       const text = buildChangeMessage(events, config);
       if (!text) {
         log(`偵測到 ${events.length} 項變化,但依設定不需通知`);
